@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -172,6 +173,7 @@ func writeDesktopFile(ai AppImage) error {
 	)
 	cfg.Section("Desktop Entry").Key(ExecLocationKey).SetValue(ai.Path)
 	cfg.Section("Desktop Entry").Key("TryExec").SetValue(arg0abs) // Resolve to a full path
+	ensureStartupWMClass(ai, cfg, origExec)
 	// For icons, use absolute paths. This way icons start working
 	// without having to restart the desktop, and possibly
 	// we can even get around messing around with the XDG icon spec
@@ -364,4 +366,166 @@ func fixDesktopFile(input []byte) []byte {
 	}
 	output = bytes.ReplaceAll(output, []byte("；"), []byte(";"))
 	return output
+}
+
+// ensureStartupWMClass sets StartupWMClass when the bundled desktop file lacks a usable value.
+func ensureStartupWMClass(ai AppImage, cfg *ini.File, origExec string) {
+	sect := cfg.Section("Desktop Entry")
+
+	// Many Electron AppImages ship a display-name StartupWMClass while the real
+	// WM_CLASS matches the AppRun BIN= executable (e.g. project-meta vs Heptabase).
+	if wmclass := startupWMClassFromAppRun(ai, origExec); wmclass != "" {
+		sect.Key("StartupWMClass").SetValue(wmclass)
+		if *verbosePtr {
+			log.Println("desktop: Set StartupWMClass to", wmclass, "for", ai.Path)
+		}
+		return
+	}
+
+	if helpers.ValidStartupWMClass(sect.Key("StartupWMClass").String()) {
+		return
+	}
+	if wmclass := guessStartupWMClass(ai, origExec, cfg); wmclass != "" {
+		sect.Key("StartupWMClass").SetValue(wmclass)
+		if *verbosePtr {
+			log.Println("desktop: Set StartupWMClass to", wmclass, "for", ai.Path)
+		}
+	}
+}
+
+func guessStartupWMClass(ai AppImage, origExec string, cfg *ini.File) string {
+	if wmclass := execProgramBaseName(ai, origExec); wmclass != "" {
+		return wmclass
+	}
+	if wmclass := startupWMClassFromBundledDesktops(ai); wmclass != "" {
+		return wmclass
+	}
+	if wmclass := startupWMClassFromElectronMetadata(ai); wmclass != "" {
+		return wmclass
+	}
+	return strings.TrimSpace(cfg.Section("Desktop Entry").Key("Name").String())
+}
+
+func startupWMClassFromAppRun(ai AppImage, origExec string) string {
+	tokens := tokenizeExec(origExec)
+	idx := 0
+	if len(tokens) > 0 && tokens[0] == "env" {
+		idx++
+	}
+	for idx < len(tokens) && looksLikeEnvVar(tokens[idx]) {
+		idx++
+	}
+	if idx >= len(tokens) || tokens[idx] != "AppRun" {
+		return ""
+	}
+	return readAppRunBinary(ai)
+}
+
+func startupWMClassFromBundledDesktops(ai AppImage) string {
+	dirs := []string{"usr/share/applications", "usr/local/share/applications", "share/applications"}
+	for _, dir := range dirs {
+		for _, file := range ai.ListFiles(dir) {
+			if !strings.HasSuffix(file, ".desktop") {
+				continue
+			}
+			if wmclass := readStartupWMClassFromAppImageFile(ai, dir+"/"+file); wmclass != "" {
+				return wmclass
+			}
+		}
+	}
+	return ""
+}
+
+func readStartupWMClassFromAppImageFile(ai AppImage, path string) string {
+	rdr, err := ai.ExtractFileReader(path)
+	if err != nil {
+		return ""
+	}
+	defer rdr.Close()
+
+	raw, err := io.ReadAll(rdr)
+	if err != nil {
+		return ""
+	}
+	escaped := bytes.ReplaceAll(raw, []byte(";"), []byte("；"))
+	cfg, err := ini.Load(escaped)
+	if err != nil {
+		return ""
+	}
+	wmclass := strings.TrimSpace(cfg.Section("Desktop Entry").Key("StartupWMClass").String())
+	if helpers.ValidStartupWMClass(wmclass) {
+		return wmclass
+	}
+	return ""
+}
+
+func startupWMClassFromElectronMetadata(ai AppImage) string {
+	paths := []string{
+		"resources/app/package.json",
+		"usr/share/resources/app/package.json",
+	}
+	for _, path := range paths {
+		if wmclass := readElectronDesktopNameFromPath(ai, path); wmclass != "" {
+			return wmclass
+		}
+	}
+	return readElectronDesktopNameFromPath(ai, "resources/app.asar")
+}
+
+func readElectronDesktopNameFromPath(ai AppImage, path string) string {
+	rdr, err := ai.ExtractFileReader(path)
+	if err != nil {
+		return ""
+	}
+	defer rdr.Close()
+
+	data, err := io.ReadAll(rdr)
+	if err != nil {
+		return ""
+	}
+	fields := []string{"desktopName", "productName"}
+	if strings.HasSuffix(path, "package.json") {
+		fields = append(fields, "name")
+	}
+	for _, field := range fields {
+		if value := helpers.ExtractJSONStringField(data, field); helpers.ValidStartupWMClass(value) {
+			return value
+		}
+	}
+	return ""
+}
+
+func execProgramBaseName(ai AppImage, origExec string) string {
+	tokens := tokenizeExec(origExec)
+	idx := 0
+	if len(tokens) > 0 && tokens[0] == "env" {
+		idx++
+	}
+	for idx < len(tokens) && looksLikeEnvVar(tokens[idx]) {
+		idx++
+	}
+	if idx >= len(tokens) {
+		return ""
+	}
+	prog := tokens[idx]
+	if prog == "AppRun" {
+		if bin := readAppRunBinary(ai); bin != "" {
+			return bin
+		}
+	}
+	return filepath.Base(prog)
+}
+
+func readAppRunBinary(ai AppImage) string {
+	rdr, err := ai.ExtractFileReader("AppRun")
+	if err != nil {
+		return ""
+	}
+	defer rdr.Close()
+
+	content, err := io.ReadAll(rdr)
+	if err != nil {
+		return ""
+	}
+	return helpers.ParseAppRunBinary(string(content))
 }
